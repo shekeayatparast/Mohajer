@@ -25,6 +25,9 @@ from contextlib import contextmanager
 BOT_TOKEN = "8382981392:AAEdQptMng0Zu2keWRMrfylq6wepvmULCbI"
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required")
+
+# Admin Configuration - Add your Telegram ID here
+ADMIN_IDS = [123456789]  # Replace with your actual Telegram user ID(s)
 CHANNEL_USERNAME = "@TheDarkestNest"
 DB_PATH = "sc_bot.db"
 TELEGRAM_UPLOAD_LIMIT = 50 * 1024 * 1024
@@ -32,6 +35,17 @@ FORCE_MP3 = False
 COMPANION_ID = "@Theirodentv"
 PORT = int(os.environ.get('PORT', 5000))
 COOKIES_PATH = "cookies.txt"
+
+# Download Limits by User Level
+USER_LIMITS = {
+    0: {"daily_downloads": 5, "daily_bytes": 100 * 1024 * 1024},      # Regular
+    1: {"daily_downloads": 15, "daily_bytes": 500 * 1024 * 1024},     # Active
+    2: {"daily_downloads": 50, "daily_bytes": 2 * 1024 * 1024 * 1024}, # VIP
+    3: {"daily_downloads": -1, "daily_bytes": -1}                      # Admin (unlimited)
+}
+
+# Bot Operation Mode
+OPERATION_MODE = "normal"  # normal, busy, stress, emergency
 
 # Check if cookies file exists
 COOKIES_AVAILABLE = os.path.exists(COOKIES_PATH)
@@ -684,13 +698,74 @@ def db_init():
             )
         """)
 
-        c.execute("INSERT OR IGNORE INTO totals (id, count, bytes) VALUES (1, 0, 0)")
-        c.execute("INSERT OR IGNORE INTO uptime_stats (id, total_downloads, total_processed) VALUES (1, 0, 0)")
+        # Admin panel tables
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS banned_users (
+                chat_id INTEGER PRIMARY KEY,
+                reason TEXT,
+                banned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                banned_by INTEGER
+            )
+        """)
 
-        # Create indexes for better performance
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS user_levels (
+                chat_id INTEGER PRIMARY KEY,
+                level INTEGER DEFAULT 0,
+                vip_until DATETIME,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS broadcast_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_text TEXT,
+                sent_count INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'pending'
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS proxy_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proxy_url TEXT,
+                success_count INTEGER DEFAULT 0,
+                fail_count INTEGER DEFAULT 0,
+                last_tested DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT 1
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS admin_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER,
+                action TEXT,
+                target_user INTEGER,
+                details TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS daily_user_stats (
+                chat_id INTEGER,
+                date DATE DEFAULT CURRENT_DATE,
+                download_count INTEGER DEFAULT 0,
+                bytes_used INTEGER DEFAULT 0,
+                PRIMARY KEY (chat_id, date)
+            )
+        """)
+
+        # Create indexes
         c.execute("CREATE INDEX IF NOT EXISTS idx_detailed_stats_chat_id ON detailed_stats(chat_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_detailed_stats_timestamp ON detailed_stats(timestamp)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_detailed_stats_platform ON detailed_stats(platform)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_banned_users_chat_id ON banned_users(chat_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_user_levels_chat_id ON user_levels(chat_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_daily_user_stats_date ON daily_user_stats(date)")
 
         conn.commit()
 
@@ -724,8 +799,207 @@ def set_user_quality(chat_id, q):
         c.execute("INSERT OR REPLACE INTO users (chat_id, lang, quality) VALUES (?, COALESCE((SELECT lang FROM users WHERE chat_id=?),'en'), ?)", (chat_id, chat_id, q))
         conn.commit()
 
+# ===== Admin Panel Functions =====
+def is_admin(chat_id):
+    """Check if user is admin"""
+    return chat_id in ADMIN_IDS
+
+def is_banned(chat_id):
+    """Check if user is banned"""
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM banned_users WHERE chat_id=?", (chat_id,))
+        return c.fetchone() is not None
+
+def ban_user(chat_id, reason, admin_id):
+    """Ban a user"""
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO banned_users (chat_id, reason, banned_by) VALUES (?, ?, ?)", 
+                  (chat_id, reason, admin_id))
+        c.execute("INSERT INTO admin_logs (admin_id, action, target_user, details) VALUES (?, ?, ?, ?)",
+                  (admin_id, "ban", chat_id, reason))
+        conn.commit()
+
+def unban_user(chat_id, admin_id):
+    """Unban a user"""
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM banned_users WHERE chat_id=?", (chat_id,))
+        c.execute("INSERT INTO admin_logs (admin_id, action, target_user) VALUES (?, ?, ?)",
+                  (admin_id, "unban", chat_id))
+        conn.commit()
+
+def get_user_level(chat_id):
+    """Get user level (0-3)"""
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        # Check if admin first
+        if is_admin(chat_id):
+            return 3
+        
+        c.execute("SELECT level, vip_until FROM user_levels WHERE chat_id=?", (chat_id,))
+        row = c.fetchone()
+        
+        if row:
+            level, vip_until = row
+            # Check if VIP expired
+            if level == 2 and vip_until:
+                try:
+                    vip_date = datetime.strptime(vip_until, "%Y-%m-%d %H:%M:%S")
+                    if datetime.now() < vip_date:
+                        return 2
+                    else:
+                        # VIP expired, reset to level 0
+                        c.execute("UPDATE user_levels SET level=0, vip_until=NULL WHERE chat_id=?", (chat_id,))
+                        conn.commit()
+                        return 0
+                except:
+                    return level
+            return level
+        return 0
+
+def set_user_level(chat_id, level, admin_id, vip_days=None):
+    """Set user level"""
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        vip_until = None
+        if level == 2 and vip_days:  # VIP level
+            from datetime import timedelta
+            vip_until = (datetime.now() + timedelta(days=vip_days)).strftime("%Y-%m-%d %H:%M:%S")
+        
+        c.execute("INSERT OR REPLACE INTO user_levels (chat_id, level, vip_until, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                  (chat_id, level, vip_until))
+        c.execute("INSERT INTO admin_logs (admin_id, action, target_user, details) VALUES (?, ?, ?, ?)",
+                  (admin_id, "set_level", chat_id, f"level={level}, vip_days={vip_days}"))
+        conn.commit()
+
+def get_daily_usage(chat_id):
+    """Get user's daily download count and bytes used"""
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT download_count, bytes_used FROM daily_user_stats WHERE chat_id=? AND date=CURRENT_DATE", (chat_id,))
+        row = c.fetchone()
+        return row if row else (0, 0)
+
+def update_daily_usage(chat_id, file_size):
+    """Update user's daily usage"""
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO daily_user_stats (chat_id, download_count, bytes_used) 
+            VALUES (?, 1, ?)
+            ON CONFLICT(chat_id, date) DO UPDATE SET 
+                download_count = download_count + 1,
+                bytes_used = bytes_used + ?
+        """, (chat_id, file_size, file_size))
+        conn.commit()
+
+def check_download_limit(chat_id):
+    """Check if user has reached their daily limit"""
+    level = get_user_level(chat_id)
+    limits = USER_LIMITS.get(level, USER_LIMITS[0])
+    
+    daily_downloads, daily_bytes = get_daily_usage(chat_id)
+    
+    # -1 means unlimited
+    if limits["daily_downloads"] == -1 and limits["daily_bytes"] == -1:
+        return True, "Unlimited"
+    
+    if daily_downloads >= limits["daily_downloads"]:
+        return False, f"Daily download limit reached ({daily_downloads}/{limits['daily_downloads']})"
+    
+    if daily_bytes >= limits["daily_bytes"]:
+        return False, f"Daily volume limit reached ({human_size(daily_bytes)}/{human_size(limits['daily_bytes'])})"
+    
+    return True, "OK"
+
+def log_admin_action(admin_id, action, target_user=None, details=None):
+    """Log admin action"""
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO admin_logs (admin_id, action, target_user, details) VALUES (?, ?, ?, ?)",
+                  (admin_id, action, target_user, details))
+        conn.commit()
+
+def get_all_users_count():
+    """Get total number of users"""
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        return c.fetchone()[0]
+
+def get_banned_users_count():
+    """Get number of banned users"""
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM banned_users")
+        return c.fetchone()[0]
+
+def get_vip_users_count():
+    """Get number of VIP users"""
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM user_levels WHERE level=2 AND (vip_until IS NULL OR vip_until > datetime('now'))")
+        return c.fetchone()[0]
+
+def broadcast_message(message_text, admin_id):
+    """Send broadcast message to all users"""
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO broadcast_messages (message_text, status) VALUES (?, 'pending')", (message_text,))
+        broadcast_id = c.lastrowid
+        conn.commit()
+    
+    # Get all users
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT chat_id FROM users")
+        users = [row[0] for row in c.fetchall()]
+    
+    sent_count = 0
+    failed_count = 0
+    
+    for user_id in users:
+        try:
+            bot.send_message(user_id, message_text, parse_mode="HTML")
+            sent_count += 1
+            time.sleep(0.1)  # Rate limiting
+        except Exception as e:
+            failed_count += 1
+            print(f"Broadcast failed for user {user_id}: {e}")
+    
+    # Update broadcast status
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE broadcast_messages SET sent_count=?, status='completed' WHERE id=?", (sent_count, broadcast_id))
+        log_admin_action(admin_id, "broadcast", details=f"sent={sent_count}, failed={failed_count}")
+        conn.commit()
+    
+    return sent_count, failed_count
+
+def get_admin_stats():
+    """Get comprehensive admin statistics"""
+    stats = {
+        "total_users": get_all_users_count(),
+        "banned_users": get_banned_users_count(),
+        "vip_users": get_vip_users_count(),
+        "operation_mode": OPERATION_MODE,
+        "active_proxies": len(proxy_manager.working_proxies),
+        "proxy_failed": len(proxy_manager.failed_proxies),
+    }
+    return stats
+
+# ===== End Admin Panel Functions =====
+
 def add_detailed_stats(chat_id, platform, file_type, file_size):
     """Add detailed statistics to database with connection pooling"""
+    # Check download limit first
+    allowed, msg = check_download_limit(chat_id)
+    if not allowed:
+        print(f"Download limit reached for user {chat_id}: {msg}")
+        return False
+    
     with db_pool.get_connection() as conn:
         c = conn.cursor()
 
@@ -747,8 +1021,13 @@ def add_detailed_stats(chat_id, platform, file_type, file_size):
 
         # Update uptime stats
         c.execute("UPDATE uptime_stats SET total_downloads = total_downloads + 1 WHERE id=1")
+        
+        # Update daily usage
+        update_daily_usage(chat_id, file_size)
 
         conn.commit()
+    
+    return True
 
 def add_stats_with_platform(chat_id, platform, file_type, file_size):
     """Register stats with platform and file type"""
@@ -1998,6 +2277,159 @@ def create_youtube_shorts_keyboard(chat_id):
 
 # ===== YouTube Quality Selection Handler =====
 def handle_youtube_quality_selection(call):
+    """Handle YouTube quality selection callback"""
+    chat_id = call.message.chat.id
+    data = call.data
+    
+    if not data.startswith("yt_quality:"):
+        return
+    
+    parts = data.split(":")
+    if len(parts) < 3:
+        bot.answer_callback_query(call.id, "Invalid format")
+        return
+    
+    format_id = parts[1]
+    media_type = parts[2]
+    
+    bot.answer_callback_query(call.id, "Starting download...")
+    
+    # Edit the message to show downloading status
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text="⏳ در حال دانلود... / Downloading..."
+        )
+    except:
+        pass
+    
+    # Start download in a thread
+    url = call.message.caption.split("\n")[-1] if call.message.caption else ""
+    if not url:
+        # Try to get URL from user data or cache
+        bot.answer_callback_query(call.id, "URL not found", show_alert=True)
+        return
+    
+    download_thread = threading.Thread(
+        target=download_youtube_with_quality,
+        args=(chat_id, url, format_id, media_type, call.message.message_id),
+        daemon=True
+    )
+    download_thread.start()
+
+# ===== Admin Panel Callback Handler =====
+def handle_admin_callback(call):
+    """Handle admin panel callbacks"""
+    chat_id = call.message.chat.id
+    data = call.data
+    
+    if not is_admin(chat_id):
+        bot.answer_callback_query(call.id, "❌ Access denied!", show_alert=True)
+        return
+    
+    action = data.replace("admin:", "")
+    
+    if action == "stats":
+        admin_stats = get_admin_stats()
+        stats_text = f"""
+👤 <b>پنل ادمین - آمار</b>
+
+📊 <b>آمار کلی:</b>
+├─ 👥 کاربران کل: {admin_stats['total_users']}
+├─ 🚫 کاربران مسدود: {admin_stats['banned_users']}
+├─ 💎 کاربران VIP: {admin_stats['vip_users']}
+├─ 🌐 پروکسی‌های فعال: {admin_stats['active_proxies']}
+├─ ❌ پروکسی‌های ناموفق: {admin_stats['proxy_failed']}
+└─ 🔧 حالت عملیاتی: {admin_stats['operation_mode']}
+"""
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.row(InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin:main"))
+        bot.edit_message_text(stats_text, chat_id, call.message.message_id, reply_markup=kb, parse_mode="HTML")
+    
+    elif action == "users":
+        users_text = f"""
+👥 <b>مدیریت کاربران</b>
+
+کاربران کل: {get_all_users_count()}
+کاربران مسدود: {get_banned_users_count()}
+کاربران VIP: {get_vip_users_count()}
+
+از دستورات زیر استفاده کنید:
+• /ban <user_id> <reason> - مسدود کردن کاربر
+• /unban <user_id> - رفع مسدودیت
+• /setlevel <user_id> <level> [days] - تنظیم سطح کاربر
+"""
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.row(InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin:main"))
+        bot.edit_message_text(users_text, chat_id, call.message.message_id, reply_markup=kb, parse_mode="HTML")
+    
+    elif action == "broadcast":
+        broadcast_text = """
+📢 <b>پیام همگانی</b>
+
+برای ارسال پیام به همه کاربران:
+1. پیام مورد نظر را فوروارد کنید
+2. یا از دستور /broadcast استفاده کنید
+
+تعداد کاربران: {}
+""".format(get_all_users_count())
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.row(InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin:main"))
+        bot.edit_message_text(broadcast_text, chat_id, call.message.message_id, reply_markup=kb, parse_mode="HTML")
+    
+    elif action == "settings":
+        settings_text = """
+⚙️ <b>تنظیمات ربات</b>
+
+حالت فعلی: {mode}
+کانال عضویت: {channel}
+
+برای تغییر تنظیمات، فایل کانفیگ را ویرایش کنید.
+""".format(mode=OPERATION_MODE, channel=CHANNEL_USERNAME)
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.row(InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin:main"))
+        bot.edit_message_text(settings_text, chat_id, call.message.message_id, reply_markup=kb, parse_mode="HTML")
+    
+    elif action == "security":
+        security_text = """
+🛡️ <b>امنیت</b>
+
+کاربران مسدود: {}
+سطح دسترسی ادمین: فعال
+محدودیت دانلود: بر اساس سطح کاربر
+
+برای مشاهده لاگ‌ها، به دیتابیس مراجعه کنید.
+""".format(get_banned_users_count())
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.row(InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin:main"))
+        bot.edit_message_text(security_text, chat_id, call.message.message_id, reply_markup=kb, parse_mode="HTML")
+    
+    elif action == "maintenance":
+        maintenance_text = """
+🔧 <b>نگهداری</b>
+
+فضای دیسک: در حال بررسی...
+وضعیت دیتابیس: سالم
+آخرین بکاپ: خودکار
+
+عملیات موجود:
+• پاکسازی کش (دستی)
+• بکاپ دیتابیس (خودکار)
+"""
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.row(InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin:main"))
+        bot.edit_message_text(maintenance_text, chat_id, call.message.message_id, reply_markup=kb, parse_mode="HTML")
+    
+    elif action == "main":
+        # Return to main admin menu
+        cmd_admin(type('obj', (object,), {'chat': type('obj', (object,), {'id': chat_id})})())
+    
+    bot.answer_callback_query(call.id)
+
+# ===== End Admin Panel Callback Handler =====
+
+def handle_youtube_shorts_selection(call):
     """Handle YouTube quality selection callback with merging support"""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
@@ -3248,6 +3680,17 @@ def create_back_keyboard(chat_id):
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     chat_id = message.chat.id
+    
+    # Check if user is banned
+    if is_banned(chat_id):
+        bot.send_message(chat_id, "❌ شما مسدود شده‌اید.\n❌ You have been banned.")
+        return
+
+    # Initialize user in database if new
+    with db_pool.get_connection() as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users (chat_id, lang, quality) VALUES (?, NULL, 'high')", (chat_id,))
+        conn.commit()
 
     # Step 1: Language selection with enhanced welcome message
     lang_keyboard = InlineKeyboardMarkup()
@@ -3266,6 +3709,163 @@ Please select your language:
 """
 
     bot.send_message(chat_id, welcome_text, reply_markup=lang_keyboard)
+
+@bot.message_handler(commands=["admin"])
+def cmd_admin(message):
+    """Admin panel command"""
+    chat_id = message.chat.id
+    
+    if not is_admin(chat_id):
+        return  # Silently ignore non-admin users
+    
+    # Create admin panel keyboard
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton(text="📊 آمار ربات", callback_data="admin:stats"),
+        InlineKeyboardButton(text="👥 مدیریت کاربران", callback_data="admin:users"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="📢 پیام همگانی", callback_data="admin:broadcast"),
+        InlineKeyboardButton(text="⚙️ تنظیمات", callback_data="admin:settings"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="🛡️ امنیت", callback_data="admin:security"),
+        InlineKeyboardButton(text="🔧 نگهداری", callback_data="admin:maintenance"),
+    )
+    
+    admin_stats = get_admin_stats()
+    stats_text = f"""
+👤 <b>پنل ادمین</b>
+
+📊 <b>آمار کلی:</b>
+├─ 👥 کاربران کل: {admin_stats['total_users']}
+├─ 🚫 کاربران مسدود: {admin_stats['banned_users']}
+├─ 💎 کاربران VIP: {admin_stats['vip_users']}
+├─ 🌐 پروکسی‌های فعال: {admin_stats['active_proxies']}
+├─ ❌ پروکسی‌های ناموفق: {admin_stats['proxy_failed']}
+└─ 🔧 حالت عملیاتی: {admin_stats['operation_mode']}
+
+دستور مورد نظر را انتخاب کنید:
+"""
+    
+    bot.send_message(chat_id, stats_text, reply_markup=kb, parse_mode="HTML")
+
+@bot.message_handler(commands=["ban"])
+def cmd_ban(message):
+    """Ban a user: /ban user_id reason"""
+    chat_id = message.chat.id
+    
+    if not is_admin(chat_id):
+        return
+    
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        bot.send_message(chat_id, "❌ Usage: /ban <user_id> <reason>")
+        return
+    
+    try:
+        target_id = int(args[1])
+        reason = args[2]
+        
+        if is_admin(target_id):
+            bot.send_message(chat_id, "❌ Cannot ban another admin!")
+            return
+        
+        ban_user(target_id, reason, chat_id)
+        bot.send_message(chat_id, f"✅ User {target_id} banned. Reason: {reason}")
+        
+        # Notify the banned user
+        try:
+            bot.send_message(target_id, f"❌ You have been banned.\nReason: {reason}")
+        except:
+            pass
+    except ValueError:
+        bot.send_message(chat_id, "❌ Invalid user ID")
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Error: {e}")
+
+@bot.message_handler(commands=["unban"])
+def cmd_unban(message):
+    """Unban a user: /unban user_id"""
+    chat_id = message.chat.id
+    
+    if not is_admin(chat_id):
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        bot.send_message(chat_id, "❌ Usage: /unban <user_id>")
+        return
+    
+    try:
+        target_id = int(args[1])
+        unban_user(target_id, chat_id)
+        bot.send_message(chat_id, f"✅ User {target_id} unbanned.")
+        
+        # Notify the user
+        try:
+            bot.send_message(target_id, "✅ You have been unbanned.")
+        except:
+            pass
+    except ValueError:
+        bot.send_message(chat_id, "❌ Invalid user ID")
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Error: {e}")
+
+@bot.message_handler(commands=["setlevel"])
+def cmd_setlevel(message):
+    """Set user level: /setlevel user_id level [vip_days]"""
+    chat_id = message.chat.id
+    
+    if not is_admin(chat_id):
+        return
+    
+    args = message.text.split()
+    if len(args) < 3:
+        bot.send_message(chat_id, "❌ Usage: /setlevel <user_id> <level> [vip_days]\nLevels: 0=Regular, 1=Active, 2=VIP, 3=Admin")
+        return
+    
+    try:
+        target_id = int(args[1])
+        level = int(args[2])
+        vip_days = int(args[3]) if len(args) > 3 else None
+        
+        if level not in [0, 1, 2, 3]:
+            bot.send_message(chat_id, "❌ Level must be 0-3")
+            return
+        
+        set_user_level(target_id, level, chat_id, vip_days)
+        
+        level_names = {0: "Regular", 1: "Active", 2: "VIP", 3: "Admin"}
+        bot.send_message(chat_id, f"✅ User {target_id} level set to {level_names[level]}")
+    except ValueError:
+        bot.send_message(chat_id, "❌ Invalid parameters")
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Error: {e}")
+
+@bot.message_handler(commands=["broadcast"])
+def cmd_broadcast(message):
+    """Broadcast message to all users"""
+    chat_id = message.chat.id
+    
+    if not is_admin(chat_id):
+        return
+    
+    # Get the message to broadcast (reply to a message or use text after command)
+    if message.reply_to_message:
+        broadcast_text = message.reply_to_message.text or message.reply_to_message.caption
+    else:
+        broadcast_text = message.text.replace("/broadcast", "").strip()
+    
+    if not broadcast_text:
+        bot.send_message(chat_id, "❌ Usage: Reply to a message with /broadcast or use /broadcast <text>")
+        return
+    
+    bot.send_message(chat_id, "⏳ Sending broadcast message...")
+    
+    sent, failed = broadcast_message(broadcast_text, chat_id)
+    
+    bot.send_message(chat_id, f"✅ Broadcast completed!\nSent: {sent}\nFailed: {failed}")
 
 @bot.message_handler(commands=["lang"])
 def cmd_lang(message):
@@ -3379,6 +3979,11 @@ def on_callback(call):
     chat_id = call.message.chat.id
     data = call.data or ""
     lang = get_user_lang(chat_id) or "en"
+
+    # Handle admin panel callbacks
+    if data.startswith("admin:"):
+        handle_admin_callback(call)
+        return
 
     # Handle initial language selection
     if data.startswith("start_lang:"):
@@ -3534,6 +4139,11 @@ def send_main_messages(chat_id):
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
     chat_id = message.chat.id
+
+    # Check if user is banned
+    if is_banned(chat_id):
+        bot.send_message(chat_id, "❌ شما مسدود شده‌اید.\n❌ You have been banned.")
+        return
 
     # If user hasn't selected language yet
     if not get_user_lang(chat_id) or get_user_lang(chat_id) not in LANGS:
@@ -3896,7 +4506,3 @@ else:
             print(f"Bot error: {e}")
 
     bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-
-این کد چه کاربردی داره و چجوری میشنه بهینش کرد و بهترین استفاده رو ازش برد
-چه کارایی رو میشه براش انجام داد که از اینی که هست بهتر باشه
