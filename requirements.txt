@@ -1,0 +1,13 @@
+pyrogram==2.0.106
+tgcrypto
+yt-dlp
+mutagen
+requests
+beautifulsoup4
+lxml
+spotipy
+deezer-py
+aiohttp
+python-dotenv
+pillow
+socksio
