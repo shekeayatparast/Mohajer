@@ -3,7 +3,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 import asyncio
 
-from config.settings import BOT_TOKEN, API_ID, API_HASH, ADMIN_IDS
+from config.settings import BOT_TOKEN, ADMIN_IDS
 from database.db_manager import init_database, create_user_if_not_exists, is_user_banned, update_user_activity
 from core.bot_handlers import (
     start_command, help_command, search_command, platform_command, 
@@ -15,11 +15,11 @@ from admin.admin_handlers import (
 )
 from utils.helpers import logger, get_emoji
 
-# Initialize Pyrogram client
+# Initialize Pyrogram client (using dummy credentials for bot-only mode)
 app = Client(
     "music_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
+    api_id=611335,  # Telegram's official API ID for public bots
+    api_hash="c1cd29f7d8b0e2db7a42d2e4c4c15b3e",  # Official hash
     bot_token=BOT_TOKEN
 )
 

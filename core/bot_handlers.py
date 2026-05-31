@@ -4,7 +4,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 import asyncio
 import os
 
-from config.settings import BOT_TOKEN, API_ID, API_HASH, ADMIN_IDS, PLATFORMS, DEFAULT_SEARCH_PLATFORM
+from config.settings import BOT_TOKEN, ADMIN_IDS, PLATFORMS, DEFAULT_SEARCH_PLATFORM
 from database.db_manager import (
     init_database, create_user_if_not_exists, is_user_banned, 
     get_user_quota, increment_download_count, add_download_history,
